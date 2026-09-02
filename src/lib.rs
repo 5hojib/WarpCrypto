@@ -1,4 +1,5 @@
-use aes::cipher::{BlockBackend, BlockClosure, BlockDecrypt, BlockEncrypt, BlockSizeUser, KeyInit};
+use aes::cipher::{BlockBackend, BlockClosure, BlockDecrypt, BlockEncrypt, BlockSizeUser, KeyInit, ParBlocks};
+use aes::cipher::typenum::Unsigned;
 use aes::cipher::inout::InOut;
 use aes::Aes256;
 use aes::cipher::generic_array::GenericArray;
@@ -14,6 +15,13 @@ thread_local! {
 }
 
 const SCRATCH_KEEP: usize = 2 * 1024 * 1024;
+
+const GIL_RELEASE_MIN: usize = 2048;
+
+#[inline(always)]
+fn maybe_detach<T: Send>(py: Python<'_>, len: usize, f: impl FnOnce() -> T + Send) -> T {
+    if len >= GIL_RELEASE_MIN { py.detach(f) } else { f() }
+}
 
 fn scratch_take() -> Vec<u8> {
     SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()))
@@ -136,10 +144,7 @@ fn kdf_inner(auth_key: &[u8], msg_key: &[u8], x: usize) -> ([u8; 32], [u8; 32]) 
 
 #[inline(always)]
 fn ctr_next(ctr: &mut [u8; 16]) {
-    for k in (0..16).rev() {
-        ctr[k] = ctr[k].wrapping_add(1);
-        if ctr[k] != 0 { break; }
-    }
+    *ctr = u128::from_be_bytes(*ctr).wrapping_add(1).to_be_bytes();
 }
 
 struct CtrProcess<'a> {
@@ -179,18 +184,15 @@ impl BlockClosure for CtrProcess<'_> {
             if pos == len { return; }
         }
 
-        const WIDE: usize = 8;
-
-        let mut wide = data[pos..].chunks_exact_mut(WIDE * 16);
+        let wide_n = B::ParBlocksSize::USIZE;
+        let mut wide = data[pos..].chunks_exact_mut(wide_n * 16);
         for group in &mut wide {
-            let mut ks = [AesBlock::default(); WIDE];
+            let mut ks: ParBlocks<B> = Default::default();
             for k in ks.iter_mut() {
                 *k = block_from_slice(ctr);
                 ctr_next(ctr);
             }
-            for k in ks.iter_mut() {
-                backend.proc_block(InOut::from(k));
-            }
+            backend.proc_par_blocks(InOut::from(&mut ks));
             for (i, k) in ks.iter().enumerate() {
                 let at = i * 16;
                 let x = u128::from_ne_bytes(group[at..at + 16].try_into().unwrap())
@@ -232,9 +234,9 @@ fn ige256_encrypt<'py>(py: Python<'py>, data: &[u8], key: &[u8], iv: &[u8]) -> P
     let mut buf = scratch_take();
     buf.clear();
     buf.extend_from_slice(data);
-    let key = key.to_vec();
-    let iv = iv.to_vec();
-    let buf = py.detach(move || {
+    let key: [u8; 32] = key.try_into().unwrap();
+    let iv: [u8; 32] = iv.try_into().unwrap();
+    let buf = maybe_detach(py, buf.len(), move || {
         let cipher = Aes256::new_from_slice(&key).unwrap();
         let mut buf = buf;
         ige256_encrypt_slice(&mut buf, &cipher, &iv);
@@ -252,9 +254,9 @@ fn ige256_decrypt<'py>(py: Python<'py>, data: &[u8], key: &[u8], iv: &[u8]) -> P
     let mut buf = scratch_take();
     buf.clear();
     buf.extend_from_slice(data);
-    let key = key.to_vec();
-    let iv = iv.to_vec();
-    let buf = py.detach(move || {
+    let key: [u8; 32] = key.try_into().unwrap();
+    let iv: [u8; 32] = iv.try_into().unwrap();
+    let buf = maybe_detach(py, buf.len(), move || {
         let cipher = Aes256::new_from_slice(&key).unwrap();
         let mut buf = buf;
         ige256_decrypt_slice(&mut buf, &cipher, &iv);
@@ -279,7 +281,7 @@ fn ctr256_encrypt<'py>(
     let mut data = scratch_take();
     data.clear();
     data.extend_from_slice(src);
-    let key = key.to_vec();
+    let key: [u8; 32] = key.try_into().unwrap();
     let mut ctr = [0u8; 16];
     unsafe {
         ctr.copy_from_slice(iv.as_bytes());
@@ -287,7 +289,7 @@ fn ctr256_encrypt<'py>(
     let mut state_off = unsafe { state.as_bytes()[0] } as usize;
     if state_off >= 16 { state_off = 0; }
 
-    let (buf, ctr_out, state_out) = py.detach(move || {
+    let (buf, ctr_out, state_out) = maybe_detach(py, data.len(), move || {
         let cipher = Aes256::new_from_slice(&key).unwrap();
         let mut buf = data;
         ctr_process(&mut buf, &cipher, &mut ctr, &mut state_off);
@@ -328,14 +330,14 @@ fn ctr256_encrypt_inplace(
     if iv.len() != 16 { return Err(PyValueError::new_err("IV must be 16 bytes")); }
 
     let mut buf = unsafe { data.as_bytes() }.to_vec();
-    let key_vec = key.to_vec();
+    let key: [u8; 32] = key.try_into().unwrap();
     let mut ctr = [0u8; 16];
     unsafe { ctr.copy_from_slice(iv.as_bytes()); }
     let mut state_off = unsafe { state.as_bytes()[0] } as usize;
     if state_off >= 16 { state_off = 0; }
 
-    let (buf, ctr_out, state_out) = py.detach(move || {
-        let cipher = Aes256::new_from_slice(&key_vec).unwrap();
+    let (buf, ctr_out, state_out) = maybe_detach(py, buf.len(), move || {
+        let cipher = Aes256::new_from_slice(&key).unwrap();
         ctr_process(&mut buf, &cipher, &mut ctr, &mut state_off);
         (buf, ctr, state_off)
     });
@@ -457,6 +459,7 @@ fn kdf(auth_key: &[u8], msg_key: &[u8], outgoing: bool) -> PyResult<(Vec<u8>, Ve
 fn pack_message<'py>(py: Python<'py>, msg_id: i64, seq_no: i32, body: &[u8], salt: i64, session_id: &[u8], auth_key: &[u8], auth_key_id: &[u8]) -> PyResult<Bound<'py, PyBytes>> {
     if auth_key.len() != 256 { return Err(PyValueError::new_err("auth_key must be 256 bytes")); }
     if auth_key_id.len() != 8 { return Err(PyValueError::new_err("auth_key_id must be 8 bytes")); }
+    if session_id.len() != 8 { return Err(PyValueError::new_err("session_id must be 8 bytes")); }
     let body_len = body.len();
     let inner_len = 8 + 8 + 8 + 4 + 4 + body_len;
     let total_plain = (inner_len + 12 + 15) & !15;
@@ -482,10 +485,10 @@ fn pack_message<'py>(py: Python<'py>, msg_id: i64, seq_no: i32, body: &[u8], sal
         let _ = getrandom::getrandom(padding);
     }
 
-    let auth_key = auth_key.to_vec();
-    let auth_key_id = auth_key_id.to_vec();
+    let auth_key: [u8; 256] = auth_key.try_into().unwrap();
+    let auth_key_id: [u8; 8] = auth_key_id.try_into().unwrap();
 
-    let out = py.detach(move || {
+    let out = maybe_detach(py, total_out, move || {
         let mut out = out;
 
         // https://core.telegram.org/mtproto/description
@@ -529,10 +532,10 @@ fn unpack_message<'py>(py: Python<'py>, packed: &[u8], session_id: &[u8], auth_k
     dec.clear();
     dec.extend_from_slice(&packed[24..]);
     let session_id = session_id.to_vec();
-    let auth_key = auth_key.to_vec();
+    let auth_key: [u8; 256] = auth_key.try_into().unwrap();
     let x: usize = if incoming { 8 } else { 0 };
 
-    let (msg_id, seq_no, length, total_len, dec) = py.detach(
+    let (msg_id, seq_no, length, total_len, dec) = maybe_detach(py, dec.len(),
         move || -> PyResult<(i64, i32, usize, i32, Vec<u8>)> {
         let (aes_key, aes_iv) = kdf_inner(&auth_key, &msg_key, x);
         let cipher = Aes256::new_from_slice(&aes_key).unwrap();
